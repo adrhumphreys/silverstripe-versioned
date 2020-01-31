@@ -10,6 +10,7 @@ use SilverStripe\Control\Middleware\HTTPMiddleware;
 use SilverStripe\Core\Convert;
 use SilverStripe\ORM\FieldType\DBField;
 use SilverStripe\Security\Security;
+use SilverStripe\Versioned\State\Site;
 
 /**
  * Initialises the versioned stage when a request is made.
@@ -26,12 +27,13 @@ class VersionedHTTPMiddleware implements HTTPMiddleware
         // Permission check
         try {
             $result = $this->checkPermissions($request);
+
             if ($result instanceof HTTPResponse) {
                 return $result;
-            } else {
-                // Set stage
-                Versioned::choose_site_stage($request);
             }
+
+            // Set stage
+            Site::singleton()->chooseSiteStage();
         } finally {
             // Reset dummy controller
             $dummyController->popCurrent();
@@ -48,7 +50,7 @@ class VersionedHTTPMiddleware implements HTTPMiddleware
     protected function checkPermissions(HTTPRequest $request)
     {
         // Block non-authenticated users from setting the stage mode
-        if (Versioned::can_choose_site_stage($request)) {
+        if (Site::singleton()->canChooseSiteStage($request)) {
             return true;
         }
 

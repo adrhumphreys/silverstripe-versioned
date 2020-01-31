@@ -2,10 +2,12 @@
 
 namespace SilverStripe\Versioned;
 
+use SilverStripe\Core\Resettable;
+
 /**
  * Used to cache instance based queries in versioned
  */
-class Cache
+class Cache implements Resettable
 {
     protected static $versionedNumberCache;
 
@@ -62,5 +64,13 @@ class Cache
         }
 
         self::$versionedNumberCache[$baseClass][$stage]['_complete'] = true;
+    }
+
+    /*
+     * Clear the cache, used for tests
+     */
+    public static function reset(): void
+    {
+        self::$versionedNumberCache = [];
     }
 }

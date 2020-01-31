@@ -186,7 +186,7 @@ class Backend
         bool $cache = true,
         string $sort = ''
     ): DataObject {
-        return State::withVersionedMode(static function () use ($class, $stage, $filter, $cache, $sort) {
+        return ReadingState::withVersionedMode(static function () use ($class, $stage, $filter, $cache, $sort) {
             Backend::singleton()->setStage($stage);
             return DataObject::get_one($class, $filter, $cache, $sort);
         });
@@ -279,7 +279,7 @@ class Backend
      * @param string $join Deprecated 3.0 Join clause. Use leftJoin($table, $joinClause) instead.
      * @param string|array $limit A limit expression to be inserted into the LIMIT clause.
      *
-     * @return DataList The objects matching the filter, in the class specified by $containerClass
+     * @return DataList The objects matching the filter
      */
     public function getByStage(
         string $class,
@@ -305,7 +305,7 @@ class Backend
     {
         ReadingMode::validateStage($stage);
 
-        State::withVersionedMode(function () use ($stage, $dataObject) {
+        ReadingState::withVersionedMode(function () use ($stage, $dataObject) {
             Backend::singleton()->setStage($stage);
             $clone = clone $dataObject;
             $clone->delete();
@@ -324,7 +324,7 @@ class Backend
     {
         ReadingMode::validateStage($stage);
 
-        return State::withVersionedMode(function () use ($stage, $forceInsert, $dataObject) {
+        return ReadingState::withVersionedMode(function () use ($stage, $forceInsert, $dataObject) {
             $oldParams = $dataObject->getSourceQueryParams();
 
             try {
@@ -349,58 +349,69 @@ class Backend
         });
     }
 
-    /**
-     * Recursively rollback draft to the given version. This will also rollback any owned objects
-     * at that point in time to the same date. Objects which didn't exist (or weren't attached)
-     * to the record at the target point in time will be "unlinked", which dis-associates
-     * the record without requiring a hard deletion.
-     *
-     * @param int|string|null $version Version ID or Versioned::LIVE to rollback from live.
-     * Pass in null to rollback to the current object
-     * @param DataObject|Versioned $dataObject The object to be rolled back
-     * @return DataObject|Versioned The object rolled back
+    /*
+     * Return the latest version of the given record.
      */
-    public function rollbackRecursive($version, DataObject $dataObject): DataObject
+    public function getLatestVersion(string $class, int $id): ?DataObject
     {
-        $dataObject->invokeWithExtensions('onBeforeRollbackRecursive', $version);
-        $this->rollbackSingle($version, $dataObject);
+        $baseClass = DataObject::getSchema()->baseDataClass($class);
+        $list = DataList::create($baseClass)
+            ->setDataQueryParam([
+                "Versioned.mode" => 'latest_version_single',
+                "Versioned.id" => $id
+            ]);
 
-        // Rollback relations on this item (works on unversioned records too)
-        $rolledBackOwner = $dataObject->getAtVersion($version);
-        if ($rolledBackOwner) {
-            $rolledBackOwner->rollbackRelations($version);
-        }
-
-        // Unlink any objects disowned as a result of this action
-        // I.e. objects which aren't owned anymore by this record, but are by the old draft record
-        $rolledBackOwner->unlinkDisownedObjects($rolledBackOwner, Versioned::DRAFT);
-        $rolledBackOwner->invokeWithExtensions('onAfterRollbackRecursive', $version);
-
-        // Get rolled back version on draft
-        return $dataObject->getAtVersion(Versioned::DRAFT);
+        return $list->first();
     }
 
     /**
-     * Rollback draft to a given version
+     * Return the equivalent of a DataList::create() call, querying the latest
+     * version of each record stored in the (class)_Versions tables.
      *
-     * @param int|string|null $version Version ID or Versioned::LIVE to rollback from live.
-     * Null to rollback current owner object.
-     * @param DataObject|Versioned $dataObject The object to be rolled back
+     * In particular, this will query deleted records as well as active ones.
+     *
+     * @param string $class The class of objects to be returned.
+     * @param string|array $filter A filter to be inserted into the WHERE clause.
+     * Supports parameterised queries. See SQLSelect::addWhere() for syntax examples.
+     * @param string|array $sort A sort expression to be inserted into the ORDER
+     * BY clause.  If omitted, DataObject::$default_sort will be used.
+
+     * @return DataList The objects matching the filter
      */
-    public function rollbackSingle($version, DataObject $dataObject)
+    public function getIncludingDeleted(string $class, $filter, $sort): DataList
     {
-        // Validate $version and safely cast
-        if (isset($version) && !is_numeric($version) && $version !== self::LIVE) {
-            throw new InvalidArgumentException("Invalid rollback source version $version");
-        }
+        return DataList::create($class)
+            ->where($filter)
+            ->sort($sort)
+            ->setDataQueryParam("Versioned.mode", "latest_versions");
+    }
 
-        if (isset($version) && is_numeric($version)) {
-            $version = (int) $version;
-        }
+    /*
+     * Return the specific version of the given id.
+     *
+     * Caution: The record is retrieved as a DataObject, but saving back
+     * modifications via write() will create a new version, rather than
+     * modifying the existing one.
+     */
+    public function getVersion(string $class, int $id, int $version): ?DataObject
+    {
+        $baseClass = DataObject::getSchema()->baseDataClass($class);
+        $list = DataList::create($baseClass)
+            ->setDataQueryParam([
+                "Versioned.mode" => 'version',
+                "Versioned.version" => $version
+            ]);
 
-        // Copy version between stage
-        $dataObject->invokeWithExtensions('onBeforeRollbackSingle', $version);
-        $dataObject->copyVersionToStage($version, Versioned::DRAFT);
-        $dataObject->invokeWithExtensions('onAfterRollbackSingle', $version);
+        return $list->byID($id);
+    }
+
+    /*
+     * Return a list of all versions for a given id.
+     */
+    public function getAllVersions(string $class, int $id): DataList
+    {
+        return DataList::create($class)
+            ->filter('ID', $id)
+            ->setDataQueryParam('Versioned.mode', 'all_versions');
     }
 }
