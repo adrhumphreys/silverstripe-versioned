@@ -2,6 +2,7 @@
 
 namespace SilverStripe\Versioned;
 
+use InvalidArgumentException;
 use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\ORM\DataObject;
 use SilverStripe\Security\Member;
@@ -15,6 +16,15 @@ class State
 {
 
     use Injectable;
+
+    /**
+     * Versioning mode for this object.
+     * Note: Not related to the current versioning mode in the state / session
+     * Will be one of 'StagedVersioned' or 'Versioned';
+     *
+     * @var string
+     */
+    private $mode;
 
     /*
      * Returns whether the current record is the latest one.
@@ -62,8 +72,7 @@ class State
         }
 
         // Non-staged objects are considered "published" if saved
-        // @TODO: hasStages
-        if (!$this->hasStages()) {
+        if (!State::singleton()->hasStages()) {
             return true;
         }
 
@@ -118,8 +127,7 @@ class State
             return false;
         }
 
-        //TODO: hasstages
-        if (!State::singleton()->hasStages($dataObject)) {
+        if (!State::singleton()->hasStages()) {
             return true;
         }
 
@@ -162,8 +170,7 @@ class State
      */
     public function getVersionedStages(DataObject $dataObject): array
     {
-        // TODO: hasStages
-        if ($dataObject->hasStages()) {
+        if (State::singleton()->hasStages()) {
             return [Versioned::DRAFT, Versioned::LIVE];
         }
 
@@ -200,5 +207,54 @@ class State
         }
 
         return Member::get_by_id($dataObject->PublisherID);
+    }
+
+    /*
+     * Compare two stages to see if they're different.
+     * Only checks the version numbers, not the actual content.
+     */
+    public function stagesDiffer(DataObject $dataObject): bool
+    {
+        $id = $dataObject->ID ?: $dataObject->OldID;
+
+        if (!$id || !State::singleton()->hasStages()) {
+            return false;
+        }
+
+        $draftVersion = Backend::singleton()
+            ->getVersionNumberByStage(get_class($dataObject), Versioned::DRAFT, $id);
+        $liveVersion = Backend::singleton()
+            ->getVersionNumberByStage(get_class($dataObject), Versioned::LIVE, $id);
+
+        return $draftVersion !== $liveVersion;
+    }
+
+    /*
+     * Set the mode to either staged versioned or versioned
+     * Mode is used to check if objects have stages, throughout various methods
+     */
+    public function setMode(string $mode): void
+    {
+        if (!in_array($mode, [Versioned::STAGEDVERSIONED, Versioned::VERSIONED])) {
+            throw new InvalidArgumentException("Invalid mode: {$mode}");
+        }
+
+        $this->mode = $mode;
+    }
+
+    /*
+     * Will return either Versioned::STAGEDVERSIONED or Versioned::VERSIONED
+     */
+    public function getMode(): string
+    {
+        return $this->mode;
+    }
+
+    /*
+     * Check if this object has stages
+     */
+    public function hasStages(): bool
+    {
+        return $this->getMode() === Versioned::STAGEDVERSIONED;
     }
 }

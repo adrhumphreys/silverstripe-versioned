@@ -10,6 +10,7 @@ use SilverStripe\Dev\Deprecation;
 use SilverStripe\ORM\DataList;
 use SilverStripe\ORM\DataObject;
 use SilverStripe\ORM\DB;
+use SilverStripe\ORM\Queries\SQLSelect;
 
 /**
  * This is instance of versioned that you can over write to change how the functions it calls are handled
@@ -169,29 +170,6 @@ class Backend
         return (bool) Config::inst()->get(Versioned::class, 'draft_site_secured');
     }
 
-    /**
-     * Get a singleton instance of a class in the given stage.
-     *
-     * @param string $class The name of the class.
-     * @param string $stage The name of the stage.
-     * @param string $filter A filter to be inserted into the WHERE clause.
-     * @param boolean $cache Use caching.
-     * @param string $sort A sort expression to be inserted into the ORDER BY clause.
-     * @return DataObject
-     */
-    public function getOneByStage(
-        string $class,
-        string $stage,
-        string $filter = '',
-        bool $cache = true,
-        string $sort = ''
-    ): DataObject {
-        return ReadingState::withVersionedMode(static function () use ($class, $stage, $filter, $cache, $sort) {
-            Backend::singleton()->setStage($stage);
-            return DataObject::get_one($class, $filter, $cache, $sort);
-        });
-    }
-
     /*
      * Gets the current version number of a specific record, returns null if no version exists
      * Be aware, this uses a hardcoded SQL query for performance
@@ -296,6 +274,29 @@ class Backend
             'Versioned.mode' => 'stage',
             'Versioned.stage' => $stage
         ]);
+    }
+
+    /**
+     * Get a singleton instance of a class in the given stage.
+     *
+     * @param string $class The name of the class.
+     * @param string $stage The name of the stage.
+     * @param string $filter A filter to be inserted into the WHERE clause.
+     * @param boolean $cache Use caching.
+     * @param string $sort A sort expression to be inserted into the ORDER BY clause.
+     * @return DataObject
+     */
+    public function getOneByStage(
+        string $class,
+        string $stage,
+        string $filter = '',
+        bool $cache = true,
+        string $sort = ''
+    ): DataObject {
+        return ReadingState::withVersionedMode(static function () use ($class, $stage, $filter, $cache, $sort) {
+            Backend::singleton()->setStage($stage);
+            return DataObject::get_one($class, $filter, $cache, $sort);
+        });
     }
 
     /*
@@ -413,5 +414,87 @@ class Backend
         return DataList::create($class)
             ->filter('ID', $id)
             ->setDataQueryParam('Versioned.mode', 'all_versions');
+    }
+
+    public function copyVersionToStage(string $fromStage, string $toStage, DataObject $dataObject): void
+    {
+        $dataObject->invokeWithExtensions('onBeforeVersionedPublish', $fromStage, $toStage);
+
+        // Get at specific version
+        $from = $this->getAtVersion($fromStage);
+
+        if (!$from) {
+            $baseClass = $dataObject->baseClass();
+            throw new InvalidArgumentException("Can't find {$baseClass}#{$dataObject->ID} in stage {$fromStage}");
+        }
+
+        $from->writeToStage($toStage);
+        $dataObject->invokeWithExtensions('onAfterVersionedPublish', $fromStage, $toStage);
+    }
+
+    /**
+     * Get this record at a specific version
+     *
+     * @param int|string|null $from Version or stage to get at. Null mean returns self object
+     * @param DataObject $dataObject
+     *
+     * @return Versioned|DataObject
+     */
+    public function getAtVersion($from, DataObject $dataObject): ?DataObject
+    {
+        // Null implies return current version
+        if (is_null($from)) {
+            return $dataObject;
+        }
+
+        $baseClass = $dataObject->baseClass();
+        $id = $dataObject->ID ?: $dataObject->OldID;
+
+        // By version number
+        if (is_numeric($from)) {
+            return Backend::singleton()->getVersion($baseClass, $id, $from);
+        }
+
+        // By stage
+        return Backend::singleton()->getByStage($baseClass, $from)->byID($id);
+    }
+
+    /*
+     * Get modified date and stage for the given version
+     * Returns an array containing 0 => LastEdited, 1 => Stage
+     * Be aware this runs a handmade SQL query
+     */
+    public function getLastEditedAndStageForVersion(int $version, DataObject $dataObject): array
+    {
+        // Cache key
+        $baseTable = $dataObject->baseTable();
+        $id = $dataObject->ID;
+        $key = "{$baseTable}#{$id}/{$version}";
+
+        if (Cache::isVersionModifiedCached($key)) {
+            return Cache::getVersionModifiedCache($key);
+        }
+
+        // Build query
+        $table = "\"{$baseTable}_Versions\"";
+        $query = SQLSelect::create(['"LastEdited"', '"WasPublished"'], $table)
+            ->addWhere([
+                "{$table}.\"RecordID\"" => $id,
+                "{$table}.\"Version\"" => $version
+            ]);
+        $result = $query->execute()->record();
+
+        if (!$result) {
+            return null;
+        }
+
+        $list = [
+            $result['LastEdited'],
+            $result['WasPublished'] ? Versioned::LIVE : Versioned::DRAFT,
+        ];
+
+        Cache::setVersionModifiedCache($key, $list);
+
+        return $list;
     }
 }

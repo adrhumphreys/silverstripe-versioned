@@ -9,7 +9,15 @@ use SilverStripe\Core\Resettable;
  */
 class Cache implements Resettable
 {
-    protected static $versionedNumberCache;
+    /**
+     * @var array
+     */
+    protected static $versionedNumberCache = [];
+
+    /**
+     * @var array
+     */
+    protected static $versionModifiedCache = [];
 
     /*
      * Set the version number cache for an item
@@ -66,11 +74,27 @@ class Cache implements Resettable
         self::$versionedNumberCache[$baseClass][$stage]['_complete'] = true;
     }
 
+    public static function setVersionModifiedCache(string $key, array $value): void
+    {
+        self::$versionModifiedCache[$key] = $value;
+    }
+
+    public static function getVersionModifiedCache(string $key): array
+    {
+        return self::$versionModifiedCache[$key] ?? [];
+    }
+
+    public static function isVersionModifiedCached(string $key): bool
+    {
+        return isset(self::$versionModifiedCache[$key]);
+    }
+
     /*
      * Clear the cache, used for tests
      */
     public static function reset(): void
     {
         self::$versionedNumberCache = [];
+        self::$versionModifiedCache = [];
     }
 }

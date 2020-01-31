@@ -25,6 +25,7 @@ use SilverStripe\ORM\Queries\SQLSelect;
 use SilverStripe\Security\Member;
 use SilverStripe\Security\Permission;
 use SilverStripe\Security\Security;
+use SilverStripe\Versioned\Query\Table;
 use SilverStripe\Versioned\State\Site;
 use SilverStripe\View\TemplateGlobalProvider;
 
@@ -43,15 +44,6 @@ use SilverStripe\View\TemplateGlobalProvider;
  */
 class Versioned extends DataExtension implements Resettable
 {
-    /**
-     * Versioning mode for this object.
-     * Note: Not related to the current versioning mode in the state / session
-     * Will be one of 'StagedVersioned' or 'Versioned';
-     *
-     * @var string
-     */
-    protected $mode;
-
     /**
      * The default reading mode
      */
@@ -303,11 +295,7 @@ class Versioned extends DataExtension implements Resettable
                 : static::VERSIONED;
         }
 
-        if (!in_array($mode, [static::STAGEDVERSIONED, static::VERSIONED])) {
-            throw new InvalidArgumentException("Invalid mode: {$mode}");
-        }
-
-        $this->mode = $mode;
+        State::singleton()->setMode($mode);
     }
 
     /**
@@ -315,24 +303,11 @@ class Versioned extends DataExtension implements Resettable
      *
      * @param int|string|null $from Version or stage to get at. Null mean returns self object
      * @return Versioned|DataObject
+     * @deprecated use Backend::singleton()->getAtVersion($from, $this->owner)
      */
     public function getAtVersion($from)
     {
-        // Null implies return current version
-        if (is_null($from)) {
-            return $this->owner;
-        }
-
-        $baseClass = $this->owner->baseClass();
-        $id = $this->owner->ID ?: $this->owner->OldID;
-
-        // By version number
-        if (is_numeric($from)) {
-            return Versioned::get_version($baseClass, $id, $from);
-        }
-
-        // By stage
-        return Versioned::get_by_stage($baseClass, $from)->byID($id);
+        return Backend::singleton()->getAtVersion($from, $this->owner);
     }
 
     /**
@@ -345,10 +320,12 @@ class Versioned extends DataExtension implements Resettable
     protected function getLastEditedForVersion($version)
     {
         Deprecation::notice('5.0', 'Use getLastEditedAndStageForVersion instead');
-        $result = $this->getLastEditedAndStageForVersion($version);
+        $result = Backend::singleton()->getLastEditedAndStageForVersion($version, $this->owner);
+
         if ($result) {
             return reset($result);
         }
+
         return null;
     }
 
@@ -357,36 +334,11 @@ class Versioned extends DataExtension implements Resettable
      *
      * @param int $version
      * @return array A list containing 0 => LastEdited, 1 => Stage
+     * @deprecated use Backend::singleton()->getLastEditedAndStageForVersion($version, $dataObject)
      */
     protected function getLastEditedAndStageForVersion($version)
     {
-        // Cache key
-        $baseTable = $this->baseTable();
-        $id = $this->owner->ID;
-        $key = "{$baseTable}#{$id}/{$version}";
-
-        // Check cache
-        if (isset($this->versionModifiedCache[$key])) {
-            return $this->versionModifiedCache[$key];
-        }
-
-        // Build query
-        $table = "\"{$baseTable}_Versions\"";
-        $query = SQLSelect::create(['"LastEdited"', '"WasPublished"'], $table)
-            ->addWhere([
-                "{$table}.\"RecordID\"" => $id,
-                "{$table}.\"Version\"" => $version
-            ]);
-        $result = $query->execute()->record();
-        if (!$result) {
-            return null;
-        }
-        $list = [
-            $result['LastEdited'],
-            $result['WasPublished'] ? static::LIVE : static::DRAFT,
-        ];
-        $this->versionModifiedCache[$key] = $list;
-        return $list;
+        return Backend::singleton()->getLastEditedAndStageForVersion($version, $this->owner);
     }
 
     /**
@@ -416,7 +368,8 @@ class Versioned extends DataExtension implements Resettable
                 // to find the date this version was published, and ensure
                 // inherited queries select from that date.
                 $version = $params['Versioned.version'];
-                $dateAndStage = $this->getLastEditedAndStageForVersion($version);
+                $dateAndStage = Backend::singleton()
+                    ->getLastEditedAndStageForVersion($version, $this->owner);
 
                 // Filter related objects at the same date as this version
                 unset($params['Versioned.version']);
@@ -847,29 +800,11 @@ SQL
      *
      * @param string $table
      * @return bool True if this table should be versioned
+     * @deprecated use Table::singleton()->isTableVersioned($table, get_class($this->owner))
      */
     protected function isTableVersioned($table)
     {
-        $schema = DataObject::getSchema();
-        $tableClass = $schema->tableClass($table);
-        if (empty($tableClass)) {
-            return false;
-        }
-
-        // Check that this class belongs to the same tree
-        $baseClass = $schema->baseDataClass($this->owner);
-        if (!is_a($tableClass, $baseClass, true)) {
-            return false;
-        }
-
-        // Check that this isn't a derived table
-        // (e.g. _Live, or a many_many table)
-        $mainTable = $schema->tableName($tableClass);
-        if ($mainTable !== $table) {
-            return false;
-        }
-
-        return true;
+        return Table::singleton()->isVersioned($table, get_class($this->owner));
     }
 
     /**
@@ -1990,20 +1925,15 @@ SQL
      * Only checks the version numbers, not the actual content.
      *
      * @return bool
+     * @deprecated use State::singleton()->stagesDiffer($this->owner)
      */
     public function stagesDiffer()
     {
         if (func_num_args() > 0) {
             Deprecation::notice('5.0', 'Versioned only has two stages and stagesDiffer no longer requires parameters');
         }
-        $id = $this->owner->ID ?: $this->owner->OldID;
-        if (!$id || !$this->hasStages()) {
-            return false;
-        }
 
-        $draftVersion = static::get_versionnumber_by_stage($this->owner, Versioned::DRAFT, $id);
-        $liveVersion = static::get_versionnumber_by_stage($this->owner, Versioned::LIVE, $id);
-        return $draftVersion !== $liveVersion;
+        return State::singleton()->stagesDiffer($this->owner);
     }
 
     /**
@@ -2135,13 +2065,11 @@ SQL
      * @param string $table Main table
      * @param string $stage
      * @return string Staged table name
+     * @deprecated use Table::singleton()->getStageTable($table, $stage)
      */
     public function stageTable($table, $stage)
     {
-        if ($this->hasStages() && $stage === static::LIVE) {
-            return "{$table}_{$stage}";
-        }
-        return $table;
+        return Table::singleton()->getStageTable($table, $stage);
     }
 
     //-----------------------------------------------------------------------------------------------//
@@ -2699,6 +2627,7 @@ SQL
      */
     public function hasStages()
     {
+
         return $this->mode === static::STAGEDVERSIONED;
     }
 
