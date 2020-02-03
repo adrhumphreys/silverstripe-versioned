@@ -25,6 +25,7 @@ use SilverStripe\ORM\Queries\SQLSelect;
 use SilverStripe\Security\Member;
 use SilverStripe\Security\Permission;
 use SilverStripe\Security\Security;
+use SilverStripe\Versioned\Query\Actions;
 use SilverStripe\Versioned\Query\Augmentation\Archive;
 use SilverStripe\Versioned\Query\Augmentation\AugmentationExtension;
 use SilverStripe\Versioned\Query\Augmentation\Stage;
@@ -79,13 +80,6 @@ class Versioned extends DataExtension implements Resettable
      * The draft (default) stage
      */
     const DRAFT = 'Stage';
-
-    /**
-     * Cache of version to modified dates for this object
-     *
-     * @var array
-     */
-    protected $versionModifiedCache = [];
 
     /**
      * Field used to hold the migrating version
@@ -583,26 +577,13 @@ class Versioned extends DataExtension implements Resettable
      *
      * @param string $baseTable base table to use as authoritative source of records
      * @param string $childTable Sub-table to clean orphans from
+     * @deprecated this will be moved to the AugmentationExtension
      */
     protected function cleanupVersionedOrphans($baseTable, $childTable)
     {
-
-    }
-
-    /**
-     * Helper for augmentDatabase() to find unique indexes and convert them to non-unique
-     *
-     * @param array $indexes The indexes to convert
-     * @return array $indexes
-     */
-    private function uniqueToIndex($indexes)
-    {
-        foreach ($indexes as &$spec) {
-            if ($spec['type'] === 'unique') {
-                $spec['type'] = 'index';
-            }
-        }
-        return $indexes;
+        $augment = AugmentationExtension::singleton();
+        $augment->setTempObject($this->owner);
+        $augment->cleanupVersionedOrphans($baseTable, $childTable);
     }
 
     /**
@@ -614,82 +595,12 @@ class Versioned extends DataExtension implements Resettable
      * @param int $recordID ID of record to version
      * @param array|string $stages Stage or array of affected stages
      * @param bool $isDelete Set to true of version is created from a deletion
+     * @deprecated this will be moved to the AugmentationExtension
      */
     protected function augmentWriteVersioned(&$manipulation, $class, $table, $recordID, $stages, $isDelete = false)
     {
-        $schema = DataObject::getSchema();
-        $baseDataClass = $schema->baseDataClass($class);
-        $baseDataTable = $schema->tableName($baseDataClass);
-
-        // Set up a new entry in (table)_Versions
-        $newManipulation = [
-            "command" => "insert",
-            "fields" => isset($manipulation[$table]['fields']) ? $manipulation[$table]['fields'] : [],
-            "class" => $class,
-        ];
-
-        // Add any extra, unchanged fields to the version record.
-        if (!$isDelete) {
-            $data = DB::prepared_query("SELECT * FROM \"{$table}\" WHERE \"ID\" = ?", [$recordID])->record();
-            if ($data) {
-                $fields = $schema->databaseFields($class, false);
-                if (is_array($fields)) {
-                    $data = array_intersect_key($data, $fields);
-
-                    foreach ($data as $k => $v) {
-                        // If the value is not set at all in the manipulation currently, use the existing value from the database
-                        if (!array_key_exists($k, $newManipulation['fields'])) {
-                            $newManipulation['fields'][$k] = $v;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Ensure that the ID is instead written to the RecordID field
-        $newManipulation['fields']['RecordID'] = $recordID;
-        unset($newManipulation['fields']['ID']);
-
-        // Generate next version ID to use
-        $nextVersion = 0;
-        if ($recordID) {
-            $nextVersion = DB::prepared_query(
-                "SELECT MAX(\"Version\") + 1
-				FROM \"{$baseDataTable}_Versions\" WHERE \"RecordID\" = ?",
-                [$recordID]
-            )->value();
-        }
-        $nextVersion = $nextVersion ?: 1;
-
-        if ($class === $baseDataClass) {
-            // Write AuthorID for baseclass
-            if ((Security::getCurrentUser())) {
-                $userID = Security::getCurrentUser()->ID;
-            } else {
-                $userID = 0;
-            }
-            $wasPublished = (int)in_array(static::LIVE, (array)$stages);
-            $wasDraft = (int)in_array(static::DRAFT, (array)$stages);
-            $newManipulation['fields'] = array_merge(
-                $newManipulation['fields'],
-                [
-                    'AuthorID' => $userID,
-                    'PublisherID' => $wasPublished ? $userID : 0,
-                    'WasPublished' => $wasPublished,
-                    'WasDraft' => $wasDraft,
-                    'WasDeleted' => (int)$isDelete,
-                ]
-            );
-
-            // Update main table version if not previously known
-            if (isset($manipulation[$table]['fields'])) {
-                $manipulation[$table]['fields']['Version'] = $nextVersion;
-            }
-        }
-
-        // Update _Versions table manipulation
-        $newManipulation['fields']['Version'] = $nextVersion;
-        $manipulation["{$table}_Versions"] = $newManipulation;
+        AugmentationExtension::singleton()
+            ->augmentWriteVersioned($manipulation, $class, $table, $recordID, $stages, $isDelete);
     }
 
     /**
@@ -698,19 +609,11 @@ class Versioned extends DataExtension implements Resettable
      * @param array $manipulation Source manipulation data
      * @param string $table Name of table
      * @param int $recordID ID of record to version
+     * @deprecated this will be moved to the AugmentationExtension
      */
     protected function augmentWriteStaged(&$manipulation, $table, $recordID)
     {
-        // If the record has already been inserted in the (table), get rid of it.
-        if ($manipulation[$table]['command'] == 'insert') {
-            DB::prepared_query(
-                "DELETE FROM \"{$table}\" WHERE \"ID\" = ?",
-                [$recordID]
-            );
-        }
-
-        $newTable = $this->stageTable($table, Versioned::get_stage());
-        $manipulation[$newTable] = $manipulation[$table];
+        AugmentationExtension::singleton()->augmentWriteStaged($manipulation, $table, $recordID);
     }
 
     /**
@@ -718,115 +621,20 @@ class Versioned extends DataExtension implements Resettable
      * the deletion applies to
      *
      * @param string[]|string $stages Stage or array of affected stages
+     * @deprecated this will be moved to the AugmentationExtension
      */
     protected function createDeletedVersion($stages = [])
     {
-        // Skip if suppressed by parent delete
-        if (!$this->getDeleteWritesVersion()) {
-            return;
-        }
-        // Prepare manipulation
-        $baseTable = $this->owner->baseTable();
-        $now = DBDatetime::now()->Rfc2822();
-        // Ensure all fixed_fields are specified
-        $manipulation = [
-            $baseTable => [
-                'fields' => [
-                    'ID' => $this->owner->ID,
-                    'LastEdited' => $now,
-                    'Created' => $this->owner->Created ?: $now,
-                    'ClassName' => $this->owner->ClassName,
-                ],
-            ],
-        ];
-        // Prepare "deleted" augment write
-        $this->augmentWriteVersioned(
-            $manipulation,
-            $this->owner->baseClass(),
-            $baseTable,
-            $this->owner->ID,
-            $stages,
-            true
-        );
-        unset($manipulation[$baseTable]);
-        $this->owner->extend('augmentWriteDeletedVersion', $manipulation, $stages);
-        DB::manipulate($manipulation);
-        $this->owner->Version = $manipulation["{$baseTable}_Versions"]['fields']['Version'];
-        $this->owner->extend('onAfterVersionDelete');
+        AugmentationExtension::singleton()->createDeletedVersion($stages);
     }
 
+    /**
+     * @param array $manipulation
+     * @deprecated this will be moved to the AugmentationExtension
+     */
     public function augmentWrite(&$manipulation)
     {
-        // get Version number from base data table on write
-        $version = null;
-        $owner = $this->owner;
-        $baseDataTable = DataObject::getSchema()->baseDataTable($owner);
-        $migratingVersion = $this->getMigratingVersion();
-        if (isset($manipulation[$baseDataTable]['fields'])) {
-            if ($migratingVersion) {
-                $manipulation[$baseDataTable]['fields']['Version'] = $migratingVersion;
-            }
-            if (isset($manipulation[$baseDataTable]['fields']['Version'])) {
-                $version = $manipulation[$baseDataTable]['fields']['Version'];
-            }
-        }
-
-        // Update all tables
-        $thisVersion = null;
-        $tables = array_keys($manipulation);
-        foreach ($tables as $table) {
-            // Make sure that the augmented write is being applied to a table that can be versioned
-            $class = isset($manipulation[$table]['class']) ? $manipulation[$table]['class'] : null;
-            if (!$class || !$this->canBeVersioned($class)) {
-                unset($manipulation[$table]);
-                continue;
-            }
-
-            // Get ID field
-            $id = $manipulation[$table]['id']
-                ? $manipulation[$table]['id']
-                : $manipulation[$table]['fields']['ID'];
-            if (!$id) {
-                user_error("Couldn't find ID in " . var_export($manipulation[$table], true), E_USER_ERROR);
-            }
-
-            if ($version < 0 || $this->getNextWriteWithoutVersion()) {
-                // Putting a Version of -1 is a signal to leave the version table alone, despite their being no version
-                unset($manipulation[$table]['fields']['Version']);
-            } else {
-                // All writes are to draft, only live affect both
-                $stages = !$this->hasStages() || static::get_stage() === static::LIVE
-                    ? [self::DRAFT, self::LIVE]
-                    : [self::DRAFT];
-                $this->augmentWriteVersioned($manipulation, $class, $table, $id, $stages, false);
-            }
-
-            // Remove "Version" column from subclasses of baseDataClass
-            if (!$this->hasVersionField($table)) {
-                unset($manipulation[$table]['fields']['Version']);
-            }
-
-            // Grab a version number - it should be the same across all tables.
-            if (isset($manipulation[$table]['fields']['Version'])) {
-                $thisVersion = $manipulation[$table]['fields']['Version'];
-            }
-
-            // If we're editing Live, then write to (table)_Live as well as (table)
-            if ($this->hasStages() && static::get_stage() === static::LIVE) {
-                $this->augmentWriteStaged($manipulation, $table, $id);
-            }
-        }
-
-        // Clear the migration flag
-        if ($migratingVersion) {
-            $this->setMigratingVersion(null);
-        }
-
-        // Add the new version # back into the data object, for accessing
-        // after this write
-        if ($thisVersion !== null) {
-            $owner->Version = str_replace("'", "", $thisVersion);
-        }
+        AugmentationExtension::singleton()->augmentWrite($manipulation);
     }
 
     /**
@@ -2170,10 +1978,9 @@ class Versioned extends DataExtension implements Resettable
     /**
      * @deprecated this doesn't do anything anymore @see Cache::reset
      */
-    public function flushCache()
+    public function flushCache(): void
     {
         // TODO: Remove this?
-        $this->versionModifiedCache = [];
     }
 
     /**
@@ -2202,11 +2009,11 @@ class Versioned extends DataExtension implements Resettable
      * Check if this object has stages
      *
      * @return bool True if this object is staged
+     * @deprecated use return State::singleton()->hasStages();
      */
     public function hasStages()
     {
-
-        return $this->mode === static::STAGEDVERSIONED;
+        return State::singleton()->hasStages();
     }
 
     /**

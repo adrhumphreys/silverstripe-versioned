@@ -19,6 +19,7 @@ use SilverStripe\ORM\DataObjectSchema;
 use SilverStripe\ORM\DB;
 use SilverStripe\ORM\FieldType\DBDatetime;
 use SilverStripe\Security\IdentityStore;
+use SilverStripe\Versioned\Cache;
 use SilverStripe\Versioned\ChangeSet;
 use SilverStripe\Versioned\Versioned;
 
@@ -744,7 +745,7 @@ class VersionedTest extends SapphireTest
         DBDatetime::clear_mock_now();
 
         // Test 1 - 2006 Content
-        singleton(VersionedTest\Subclass::class)->flushCache(true);
+        Cache::reset();
         Versioned::set_reading_mode('Archive.2006-01-01 00:00:00');
         /** @var VersionedTest\Subclass $testPage2006 */
         $testPage2006 = DataObject::get(VersionedTest\Subclass::class)->filter(['Title' => 'Archived page'])->first();
@@ -753,7 +754,7 @@ class VersionedTest extends SapphireTest
         $this->assertEquals("This is the content from 2005", $testPage2006->Content);
 
         // Test 2 - 2008 Content
-        singleton(VersionedTest\Subclass::class)->flushCache(true);
+        Cache::reset();
         Versioned::set_reading_mode('Archive.2008-01-01 00:00:00');
         /** @var VersionedTest\Subclass $testPage2008 */
         $testPage2008 = DataObject::get(VersionedTest\Subclass::class)->filter(['Title' => 'Archived page'])->first();
@@ -762,7 +763,7 @@ class VersionedTest extends SapphireTest
         $this->assertEquals("It's 2007 already!", $testPage2008->Content);
 
         // Test 3 - Today
-        singleton(VersionedTest\Subclass::class)->flushCache(true);
+        Cache::reset();
         Versioned::set_reading_mode('Stage.Stage');
         /** @var VersionedTest\Subclass $testPageCurrent */
         $testPageCurrent = DataObject::get(VersionedTest\Subclass::class)->filter(['Title' => 'Archived page'])

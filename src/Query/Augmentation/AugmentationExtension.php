@@ -9,10 +9,14 @@ use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\ORM\DataObject;
 use SilverStripe\ORM\DataQuery;
 use SilverStripe\ORM\DB;
+use SilverStripe\ORM\FieldType\DBDatetime;
 use SilverStripe\ORM\Queries\SQLSelect;
+use SilverStripe\Security\Security;
+use SilverStripe\Versioned\Backend;
 use SilverStripe\Versioned\Query\Table;
 use SilverStripe\Versioned\State;
 use SilverStripe\Versioned\VersionableExtension;
+use SilverStripe\Versioned\Versioned;
 use SilverStripe\Versioned\Versioned as VersionedExtension;
 
 class AugmentationExtension
@@ -326,6 +330,257 @@ class AugmentationExtension
             foreach ($ids as $id) {
                 DB::prepared_query("DELETE FROM \"{$childTable}\" WHERE \"ID\" = ?", [$id]);
             }
+        }
+    }
+
+    /*
+     * Helper for augmentDatabase() to find unique indexes and convert them to non-unique
+     */
+    private function uniqueToIndex(array $indexes): array
+    {
+        foreach ($indexes as &$spec) {
+            if ($spec['type'] === 'unique') {
+                $spec['type'] = 'index';
+            }
+        }
+
+        return $indexes;
+    }
+
+    /**
+     * Generates a ($table)_version DB manipulation and injects it into the current $manipulation
+     *
+     * @param array $manipulation Source manipulation data
+     * @param string $class Class
+     * @param string $table Table Table for this class
+     * @param int $recordID ID of record to version
+     * @param array|string $stages Stage or array of affected stages
+     * @param bool $isDelete Set to true of version is created from a deletion
+     */
+    public function augmentWriteVersioned(&$manipulation, $class, $table, $recordID, $stages, $isDelete = false): void
+    {
+        $schema = DataObject::getSchema();
+        $baseDataClass = $schema->baseDataClass($class);
+        $baseDataTable = $schema->tableName($baseDataClass);
+
+        // Set up a new entry in (table)_Versions
+        $newManipulation = [
+            "command" => "insert",
+            "fields" => isset($manipulation[$table]['fields']) ? $manipulation[$table]['fields'] : [],
+            "class" => $class,
+        ];
+
+        // Add any extra, unchanged fields to the version record.
+        if (!$isDelete) {
+            $data = DB::prepared_query("SELECT * FROM \"{$table}\" WHERE \"ID\" = ?", [$recordID])->record();
+
+            if ($data) {
+                $fields = $schema->databaseFields($class, false);
+
+                if (is_array($fields)) {
+                    $data = array_intersect_key($data, $fields);
+
+                    foreach ($data as $k => $v) {
+                        // If the value is not set at all in the manipulation currently, use the existing value from the database
+                        if (!array_key_exists($k, $newManipulation['fields'])) {
+                            $newManipulation['fields'][$k] = $v;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Ensure that the ID is instead written to the RecordID field
+        $newManipulation['fields']['RecordID'] = $recordID;
+        unset($newManipulation['fields']['ID']);
+
+        // Generate next version ID to use
+        $nextVersion = 0;
+
+        if ($recordID) {
+            $nextVersion = DB::prepared_query(
+                "SELECT MAX(\"Version\") + 1
+				FROM \"{$baseDataTable}_Versions\" WHERE \"RecordID\" = ?",
+                [$recordID]
+            )->value();
+        }
+
+        $nextVersion = $nextVersion ?: 1;
+
+        if ($class === $baseDataClass) {
+            // Write AuthorID for baseclass
+            if ((Security::getCurrentUser())) {
+                $userID = Security::getCurrentUser()->ID;
+            } else {
+                $userID = 0;
+            }
+
+            $wasPublished = (int)in_array(Versioned::LIVE, (array)$stages);
+            $wasDraft = (int)in_array(Versioned::DRAFT, (array)$stages);
+            $newManipulation['fields'] = array_merge(
+                $newManipulation['fields'],
+                [
+                    'AuthorID' => $userID,
+                    'PublisherID' => $wasPublished ? $userID : 0,
+                    'WasPublished' => $wasPublished,
+                    'WasDraft' => $wasDraft,
+                    'WasDeleted' => (int)$isDelete,
+                ]
+            );
+
+            // Update main table version if not previously known
+            if (isset($manipulation[$table]['fields'])) {
+                $manipulation[$table]['fields']['Version'] = $nextVersion;
+            }
+        }
+
+        // Update _Versions table manipulation
+        $newManipulation['fields']['Version'] = $nextVersion;
+        $manipulation["{$table}_Versions"] = $newManipulation;
+    }
+
+    /**
+     * Rewrite the given manipulation to update the selected (non-default) stage
+     *
+     * @param array $manipulation Source manipulation data
+     * @param string $table Name of table
+     * @param int $recordID ID of record to version
+     */
+    public function augmentWriteStaged(&$manipulation, $table, $recordID): void
+    {
+        // If the record has already been inserted in the (table), get rid of it.
+        if ($manipulation[$table]['command'] == 'insert') {
+            DB::prepared_query(
+                "DELETE FROM \"{$table}\" WHERE \"ID\" = ?",
+                [$recordID]
+            );
+        }
+
+        $newTable = Table::singleton()->getStageTable($table, Backend::singleton()->getStage());
+        $manipulation[$newTable] = $manipulation[$table];
+    }
+
+    /**
+     * Adds a WasDeleted=1 version entry for this record, and records any stages
+     * the deletion applies to
+     *
+     * @param string[]|string $stages Stage or array of affected stages
+     */
+    public function createDeletedVersion($stages = []): void
+    {
+        $dataObject = $this->getTempObject();
+
+        // Skip if suppressed by parent delete
+        if (!$this->getDeleteWritesVersion()) {
+            return;
+        }
+
+        // Prepare manipulation
+        $baseTable = $dataObject->baseTable();
+        $now = DBDatetime::now()->Rfc2822();
+        // Ensure all fixed_fields are specified
+        $manipulation = [
+            $baseTable => [
+                'fields' => [
+                    'ID' => $dataObject->ID,
+                    'LastEdited' => $now,
+                    'Created' => $dataObject->Created ?: $now,
+                    'ClassName' => $dataObject->ClassName,
+                ],
+            ],
+        ];
+        // Prepare "deleted" augment write
+        $this->augmentWriteVersioned(
+            $manipulation,
+            $dataObject->baseClass(),
+            $baseTable,
+            $dataObject->ID,
+            $stages,
+            true
+        );
+        unset($manipulation[$baseTable]);
+        $dataObject->extend('augmentWriteDeletedVersion', $manipulation, $stages);
+        DB::manipulate($manipulation);
+        $dataObject->Version = $manipulation["{$baseTable}_Versions"]['fields']['Version'];
+        $dataObject->extend('onAfterVersionDelete');
+    }
+
+    public function augmentWrite(&$manipulation)
+    {
+        $dataObject = $this->getTempObject();
+
+        // get Version number from base data table on write
+        $version = null;
+//        $owner = $this->owner;
+
+        $baseDataTable = DataObject::getSchema()->baseDataTable($dataObject);
+        $migratingVersion = $this->getMigratingVersion();
+
+        if (isset($manipulation[$baseDataTable]['fields'])) {
+            if ($migratingVersion) {
+                $manipulation[$baseDataTable]['fields']['Version'] = $migratingVersion;
+            }
+            if (isset($manipulation[$baseDataTable]['fields']['Version'])) {
+                $version = $manipulation[$baseDataTable]['fields']['Version'];
+            }
+        }
+
+        // Update all tables
+        $thisVersion = null;
+        $tables = array_keys($manipulation);
+        foreach ($tables as $table) {
+            // Make sure that the augmented write is being applied to a table that can be versioned
+            $class = isset($manipulation[$table]['class']) ? $manipulation[$table]['class'] : null;
+
+            if (!$class || !$this->canBeVersioned($class)) {
+                unset($manipulation[$table]);
+                continue;
+            }
+
+            // Get ID field
+            $id = $manipulation[$table]['id']
+                ? $manipulation[$table]['id']
+                : $manipulation[$table]['fields']['ID'];
+            if (!$id) {
+                user_error("Couldn't find ID in " . var_export($manipulation[$table], true), E_USER_ERROR);
+            }
+
+            if ($version < 0 || $this->getNextWriteWithoutVersion()) {
+                // Putting a Version of -1 is a signal to leave the version table alone, despite their being no version
+                unset($manipulation[$table]['fields']['Version']);
+            } else {
+                // All writes are to draft, only live affect both
+                $stages = !State::singleton()->hasStages() || Backend::singleton()->getStage() === Versioned::LIVE
+                    ? [Versioned::DRAFT, Versioned::LIVE]
+                    : [Versioned::DRAFT];
+                $this->augmentWriteVersioned($manipulation, $class, $table, $id, $stages, false);
+            }
+
+            // Remove "Version" column from subclasses of baseDataClass
+            if (!$this->hasVersionField($table)) {
+                unset($manipulation[$table]['fields']['Version']);
+            }
+
+            // Grab a version number - it should be the same across all tables.
+            if (isset($manipulation[$table]['fields']['Version'])) {
+                $thisVersion = $manipulation[$table]['fields']['Version'];
+            }
+
+            // If we're editing Live, then write to (table)_Live as well as (table)
+            if (State::singleton()->hasStages() && Backend::singleton()->getStage() === Versioned::LIVE) {
+                $this->augmentWriteStaged($manipulation, $table, $id);
+            }
+        }
+
+        // Clear the migration flag
+        if ($migratingVersion) {
+            $this->setMigratingVersion(null);
+        }
+
+        // Add the new version # back into the data object, for accessing
+        // after this write
+        if ($thisVersion !== null) {
+            $dataObject->Version = str_replace("'", "", $thisVersion);
         }
     }
 }
