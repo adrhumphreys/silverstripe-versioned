@@ -56,4 +56,18 @@ class Table
 
         return $table;
     }
+
+    /*
+     * Return the base table - the class that directly extends DataObject.
+     */
+    public function getBaseTable(DataObject $dataObject, ?string $stage = null): string
+    {
+        $baseTable = $dataObject->baseTable();
+
+        if ($stage === null) {
+            return $baseTable;
+        }
+
+        return Table::singleton()->getStageTable($baseTable, $stage);
+    }
 }

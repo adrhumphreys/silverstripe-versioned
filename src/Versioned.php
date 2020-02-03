@@ -25,6 +25,16 @@ use SilverStripe\ORM\Queries\SQLSelect;
 use SilverStripe\Security\Member;
 use SilverStripe\Security\Permission;
 use SilverStripe\Security\Security;
+use SilverStripe\Versioned\Query\Augmentation\Archive;
+use SilverStripe\Versioned\Query\Augmentation\AugmentationExtension;
+use SilverStripe\Versioned\Query\Augmentation\Stage;
+use SilverStripe\Versioned\Query\Augmentation\StageUnique;
+use SilverStripe\Versioned\Query\Augmentation\Versioned as VersionedAugmentation;
+use SilverStripe\Versioned\Query\Augmentation\VersionedAll;
+use SilverStripe\Versioned\Query\Augmentation\VersionedLatest;
+use SilverStripe\Versioned\Query\Augmentation\VersionedLatestSingle;
+use SilverStripe\Versioned\Query\Augmentation\VersionedVersion;
+use SilverStripe\Versioned\Query\Helper;
 use SilverStripe\Versioned\Query\Table;
 use SilverStripe\Versioned\State\Site;
 use SilverStripe\View\TemplateGlobalProvider;
@@ -396,43 +406,12 @@ class Versioned extends DataExtension implements Resettable
      * @param SQLSelect $query
      * @param DataQuery|null $dataQuery
      * @throws InvalidArgumentException
+     * @deprecated use Base::singleton()->augmentSQL($dataObject, $query, $dataQuery);
      */
     public function augmentSQL(SQLSelect $query, DataQuery $dataQuery = null)
     {
-        if (!$dataQuery) {
-            return;
-        }
-
-        // Ensure query mode exists
-        $versionedMode = $dataQuery->getQueryParam('Versioned.mode');
-        if (!$versionedMode) {
-            return;
-        }
-        switch ($versionedMode) {
-            case 'stage':
-                $this->augmentSQLStage($query, $dataQuery);
-                break;
-            case 'stage_unique':
-                $this->augmentSQLStageUnique($query, $dataQuery);
-                break;
-            case 'archive':
-                $this->augmentSQLVersionedArchive($query, $dataQuery);
-                break;
-            case 'latest_version_single':
-                $this->augmentSQLVersionedLatestSingle($query, $dataQuery);
-                break;
-            case 'latest_versions':
-                $this->augmentSQLVersionedLatest($query, $dataQuery);
-                break;
-            case 'version':
-                $this->augmentSQLVersionedVersion($query, $dataQuery);
-                break;
-            case 'all_versions':
-                $this->augmentSQLVersionedAll($query);
-                break;
-            default:
-                throw new InvalidArgumentException("Bad value for query parameter Versioned.mode: {$versionedMode}");
-        }
+        // Ideally in a newer release we can change use the extension as an extension
+        AugmentationExtension::singleton()->augmentSQL($this->owner, $query, $dataQuery);
     }
 
     /**
@@ -440,25 +419,11 @@ class Versioned extends DataExtension implements Resettable
      *
      * @param SQLSelect $query
      * @param DataQuery $dataQuery
+     * @deprecated use Stage::singleton()->augment($this->owner, $query, $dataQuery)
      */
     protected function augmentSQLStage(SQLSelect $query, DataQuery $dataQuery)
     {
-        if (!$this->hasStages()) {
-            return;
-        }
-        $stage = $dataQuery->getQueryParam('Versioned.stage');
-        ReadingMode::validateStage($stage);
-        if ($stage === static::DRAFT) {
-            return;
-        }
-        // Rewrite all tables to select from the live version
-        foreach ($query->getFrom() as $table => $dummy) {
-            if (!$this->isTableVersioned($table)) {
-                continue;
-            }
-            $stageTable = $this->stageTable($table, $stage);
-            $query->renameTable($table, $stageTable);
-        }
+        Stage::singleton()->augment($this->owner, $query, $dataQuery);
     }
 
     /**
@@ -466,74 +431,22 @@ class Versioned extends DataExtension implements Resettable
      *
      * @param SQLSelect $query
      * @param DataQuery $dataQuery
+     * @deprecated use StageUnique::singleton()->augment($this->owner, $query, $dataQuery)
      */
     protected function augmentSQLStageUnique(SQLSelect $query, DataQuery $dataQuery)
     {
-        if (!$this->hasStages()) {
-            return;
-        }
-        // Set stage first
-        $this->augmentSQLStage($query, $dataQuery);
-
-        // Now exclude any ID from any other stage.
-        $stage = $dataQuery->getQueryParam('Versioned.stage');
-        $excludingStage = $stage === static::DRAFT ? static::LIVE : static::DRAFT;
-
-        // Note that we double rename to avoid the regular stage rename
-        // renaming all subquery references to be Versioned.stage
-        $tempName = 'ExclusionarySource_' . $excludingStage;
-        $excludingTable = $this->baseTable($excludingStage);
-        $baseTable = $this->baseTable($stage);
-        $query->addWhere("\"{$baseTable}\".\"ID\" NOT IN (SELECT \"ID\" FROM \"{$tempName}\")");
-        $query->renameTable($tempName, $excludingTable);
+        StageUnique::singleton()->augment($this->owner, $query, $dataQuery);
     }
 
     /**
      * Augment SQL to select from `_Versions` table instead.
      *
      * @param SQLSelect $query
+     * @deprecated use VersionedAugmentation::singleton()->augment($this->owner, $query, null);
      */
     protected function augmentSQLVersioned(SQLSelect $query)
     {
-        $baseTable = $this->baseTable();
-        foreach ($query->getFrom() as $alias => $join) {
-            if (!$this->isTableVersioned($alias)) {
-                continue;
-            }
-
-            if ($alias != $baseTable) {
-                // Make sure join includes version as well
-                $query->setJoinFilter(
-                    $alias,
-                    "\"{$alias}_Versions\".\"RecordID\" = \"{$baseTable}_Versions\".\"RecordID\""
-                    . " AND \"{$alias}_Versions\".\"Version\" = \"{$baseTable}_Versions\".\"Version\""
-                );
-            }
-
-            // Rewrite all usages of `Table` to `Table_Versions`
-            $query->renameTable($alias, $alias . '_Versions');
-            // However, add an alias back to the base table in case this must later be joined.
-            // See ApplyVersionFilters for example which joins _Versions back onto draft table.
-            $query->renameTable($alias . '_Draft', $alias);
-        }
-
-        // Add all <basetable>_Versions columns
-        foreach (Config::inst()->get(static::class, 'db_for_versions_table') as $name => $type) {
-            $query->selectField(sprintf('"%s_Versions"."%s"', $baseTable, $name), $name);
-        }
-
-        // Alias the record ID as the row ID, and ensure ID filters are aliased correctly
-        $query->selectField("\"{$baseTable}_Versions\".\"RecordID\"", "ID");
-        $query->replaceText("\"{$baseTable}_Versions\".\"ID\"", "\"{$baseTable}_Versions\".\"RecordID\"");
-
-        // However, if doing count, undo rewrite of "ID" column
-        $query->replaceText(
-            "count(DISTINCT \"{$baseTable}_Versions\".\"RecordID\")",
-            "count(DISTINCT \"{$baseTable}_Versions\".\"ID\")"
-        );
-
-        // Filter deleted versions, which are all unqueryable
-        $query->addWhere(["\"{$baseTable}_Versions\".\"WasDeleted\"" => 0]);
+        VersionedAugmentation::singleton()->augment($this->owner, $query, null);
     }
 
     /**
@@ -543,81 +456,23 @@ class Versioned extends DataExtension implements Resettable
      * @param SQLSelect $baseQuery
      * @param DataQuery $dataQuery
      * @return SQLSelect
+     * @deprecated use Helper::singleton()->prepareMaxVersionSubSelect($this->owner, $baseQuery, $dataQuery);
      */
     protected function prepareMaxVersionSubSelect(SQLSelect $baseQuery, DataQuery $dataQuery)
     {
-        $baseTable = $this->baseTable();
-
-        // Create a sub-select that we determine latest versions
-        $subSelect = SQLSelect::create(
-            ['LatestVersion' => "MAX(\"{$baseTable}_Versions_Latest\".\"Version\")"],
-            [$baseTable . '_Versions_Latest' => "\"{$baseTable}_Versions\""]
-        );
-
-        $subSelect->renameTable($baseTable, "{$baseTable}_Versions");
-
-        // Determine the base table of the existing query
-        $baseFrom = $baseQuery->getFrom();
-        $baseTable = trim(reset($baseFrom), '"');
-
-        // And then the name of the base table in the new query
-        $newFrom = $subSelect->getFrom();
-        $newTable = trim(key($newFrom), '"');
-
-        // Parse "where" conditions to find those appropriate to be "promoted" into an inner join
-        // We can ONLY promote a filter on the primary key of the base table. Any other conditions will make the
-        // version returned incorrect, as we are filtering out version that may be the latest (and correct) version
-        foreach ($baseQuery->getWhere() as $condition) {
-            $conditionClause = key($condition);
-            // Pull out the table and field for this condition. We'll skip anything we can't parse
-            if (preg_match('/^"([^"]+)"\."([^"]+)"/', $conditionClause, $matches) !== 1) {
-                continue;
-            }
-
-            $table = $matches[1];
-            $field = $matches[2];
-
-            if ($table !== $baseTable || $field !== 'RecordID') {
-                continue;
-            }
-
-            // Rename conditions on the base table to the new alias
-            $conditionClause = preg_replace(
-                '/^"([^"]+)"\./',
-                "\"{$newTable}\".",
-                $conditionClause
-            );
-
-            $subSelect->addWhere([$conditionClause => reset($condition)]);
-        }
-
-        $shouldApplySubSelectAsCondition = $this->shouldApplySubSelectAsCondition($baseQuery);
-
-        $this->owner->extend(
-            'augmentMaxVersionSubSelect',
-            $subSelect,
-            $dataQuery,
-            $shouldApplySubSelectAsCondition
-        );
-
-        return $subSelect;
+        return Helper::singleton()->prepareMaxVersionSubSelect($this->owner, $baseQuery, $dataQuery);
     }
 
     /**
      * Indicates if a subquery filtering versioned records should apply as a condition instead of an inner join
      *
      * @param SQLSelect $baseQuery
+     * @return bool
+     * @deprecated use Helper::singleton()->shouldApplySubSelectAsCondition($dataobject, $baseQuery)
      */
     protected function shouldApplySubSelectAsCondition(SQLSelect $baseQuery)
     {
-        $baseTable = $this->baseTable();
-
-        $shouldApply =
-            $baseQuery->getLimit() === 1 || Config::inst()->get(static::class, 'use_conditions_over_inner_joins');
-
-        $this->owner->extend('updateApplyVersionedFiltersAsConditions', $shouldApply, $baseQuery, $baseTable);
-
-        return $shouldApply;
+        return Helper::singleton()->shouldApplySubSelectAsCondition($this->owner, $baseQuery);
     }
 
     /**
@@ -625,61 +480,11 @@ class Versioned extends DataExtension implements Resettable
      *
      * @param SQLSelect $query
      * @param DataQuery $dataQuery
+     * @deprecated use Archive::singleton()->augment($this->owner, $query, $dataQuery)
      */
     protected function augmentSQLVersionedArchive(SQLSelect $query, DataQuery $dataQuery)
     {
-        $baseTable = $this->baseTable();
-        $date = $dataQuery->getQueryParam('Versioned.date');
-        if (!$date) {
-            throw new InvalidArgumentException("Invalid archive date");
-        }
-
-        // Query against _Versions table first
-        $this->augmentSQLVersioned($query);
-
-        // Validate stage
-        $stage = $dataQuery->getQueryParam('Versioned.stage');
-        ReadingMode::validateStage($stage);
-
-        $subSelect = $this->prepareMaxVersionSubSelect($query, $dataQuery);
-
-        $subSelect->addWhere(["\"{$baseTable}_Versions_Latest\".\"LastEdited\" <= ?" => $date]);
-
-        // Filter on appropriate stage column in addition to date
-        if ($this->hasStages()) {
-            $stageColumn = $stage === static::LIVE
-                ? 'WasPublished'
-                : 'WasDraft';
-            $subSelect->addWhere("\"{$baseTable}_Versions_Latest\".\"{$stageColumn}\" = 1");
-        }
-
-        if ($this->shouldApplySubSelectAsCondition($query)) {
-            $subSelect->addWhere(
-                "\"{$baseTable}_Versions_Latest\".\"RecordID\" = \"{$baseTable}_Versions\".\"RecordID\""
-            );
-
-            $query->addWhere([
-                "\"{$baseTable}_Versions\".\"Version\" = ({$subSelect->sql($params)})" => $params,
-            ]);
-
-            return;
-        }
-
-        $subSelect->addSelect("\"{$baseTable}_Versions_Latest\".\"RecordID\"");
-        $subSelect->addGroupBy("\"{$baseTable}_Versions_Latest\".\"RecordID\"");
-
-        // Join on latest version filtered by date
-        $query->addInnerJoin(
-            '(' . $subSelect->sql($params) . ')',
-            <<<SQL
-            "{$baseTable}_Versions_Latest"."RecordID" = "{$baseTable}_Versions"."RecordID"
-            AND "{$baseTable}_Versions_Latest"."LatestVersion" = "{$baseTable}_Versions"."Version"
-SQL
-            ,
-            "{$baseTable}_Versions_Latest",
-            20,
-            $params
-        );
+        Archive::singleton()->augment($this->owner, $query, $dataQuery);
     }
 
     /**
@@ -689,22 +494,11 @@ SQL
      *
      * @param SQLSelect $query
      * @param DataQuery $dataQuery
+     * @deprecated use VersionedLatestSingle::singleton()->augment($this->owner, $query, $dataQuery);
      */
     protected function augmentSQLVersionedLatestSingle(SQLSelect $query, DataQuery $dataQuery)
     {
-        $id = $dataQuery->getQueryParam('Versioned.id');
-        if (!$id) {
-            throw new InvalidArgumentException("Invalid id");
-        }
-
-        // Query against _Versions table first
-        $this->augmentSQLVersioned($query);
-
-        $baseTable = $this->baseTable();
-
-        $query->addWhere(["\"$baseTable\".\"RecordID\"" => $id]);
-        $query->setOrderBy("Version DESC");
-        $query->setLimit(1);
+       VersionedLatestSingle::singleton()->augment($this->owner, $query, $dataQuery);
     }
 
     /**
@@ -716,45 +510,11 @@ SQL
      *
      * @param SQLSelect $query
      * @param DataQuery $dataQuery
+     * @deprecated use VersionedLatest::singleton()->augment($dataObject, $query, $dataQuery);
      */
     protected function augmentSQLVersionedLatest(SQLSelect $query, DataQuery $dataQuery)
     {
-        // Query against _Versions table first
-        $this->augmentSQLVersioned($query);
-
-        // Join and select only latest version
-        $baseTable = $this->baseTable();
-        $subSelect = $this->prepareMaxVersionSubSelect($query, $dataQuery);
-
-        $subSelect->addWhere("\"{$baseTable}_Versions_Latest\".\"WasDeleted\" = 0");
-
-        if ($this->shouldApplySubSelectAsCondition($query)) {
-            $subSelect->addWhere(
-                "\"{$baseTable}_Versions_Latest\".\"RecordID\" = \"{$baseTable}_Versions\".\"RecordID\""
-            );
-
-            $query->addWhere([
-                "\"{$baseTable}_Versions\".\"Version\" = ({$subSelect->sql($params)})" => $params,
-            ]);
-
-            return;
-        }
-
-        $subSelect->addSelect("\"{$baseTable}_Versions_Latest\".\"RecordID\"");
-        $subSelect->addGroupBy("\"{$baseTable}_Versions_Latest\".\"RecordID\"");
-
-        // Join on latest version filtered by date
-        $query->addInnerJoin(
-            '(' . $subSelect->sql($params) . ')',
-            <<<SQL
-            "{$baseTable}_Versions_Latest"."RecordID" = "{$baseTable}_Versions"."RecordID"
-            AND "{$baseTable}_Versions_Latest"."LatestVersion" = "{$baseTable}_Versions"."Version"
-SQL
-            ,
-            "{$baseTable}_Versions_Latest",
-            20,
-            $params
-        );
+        VersionedLatest::singleton()->augment($this->owner, $query, $dataQuery);
     }
 
     /**
@@ -762,36 +522,22 @@ SQL
      *
      * @param SQLSelect $query
      * @param DataQuery $dataQuery
+     * @deprecated use VersionedVersion::singleton()->augment($this->owner, $query, $dataQuery);
      */
     protected function augmentSQLVersionedVersion(SQLSelect $query, DataQuery $dataQuery)
     {
-        $version = $dataQuery->getQueryParam('Versioned.version');
-        if (!$version) {
-            throw new InvalidArgumentException("Invalid version");
-        }
-
-        // Query against _Versions table first
-        $this->augmentSQLVersioned($query);
-
-        // Add filter on version field
-        $baseTable = $this->baseTable();
-        $query->addWhere([
-            "\"{$baseTable}_Versions\".\"Version\"" => $version,
-        ]);
+        VersionedVersion::singleton()->augment($this->owner, $query, $dataQuery);
     }
 
     /**
      * If all versions are requested, ensure that records are sorted by this field
      *
      * @param SQLSelect $query
+     * @deprecated use VersionedAll::singleton()->augment($dataObject, $query)
      */
     protected function augmentSQLVersionedAll(SQLSelect $query)
     {
-        // Query against _Versions table first
-        $this->augmentSQLVersioned($query);
-
-        $baseTable = $this->baseTable();
-        $query->addOrderBy("\"{$baseTable}_Versions\".\"Version\"");
+        VersionedAll::singleton()->augment($this->owner, $query);
     }
 
     /**
@@ -813,147 +559,23 @@ SQL
      * @param SQLSelect $query
      * @param DataQuery $dataQuery
      * @param DataObject $dataObject
+     * @deprecated use Base::singleton()->augmentLoadLazyFields( $query, $dataQuery, $dataObject);
      */
     public function augmentLoadLazyFields(SQLSelect &$query, DataQuery &$dataQuery = null, $dataObject)
     {
-        // The VersionedMode local variable ensures that this decorator only applies to
-        // queries that have originated from the Versioned object, and have the Versioned
-        // metadata set on the query object. This prevents regular queries from
-        // accidentally querying the *_Versions tables.
-        $versionedMode = $dataObject->getSourceQueryParam('Versioned.mode');
-        $modesToAllowVersioning = ['all_versions', 'latest_versions', 'archive', 'version'];
-        if (!empty($dataObject->Version) &&
-            (!empty($versionedMode) && in_array($versionedMode, $modesToAllowVersioning))
-        ) {
-            // This will ensure that augmentSQL will select only the same version as the owner,
-            // regardless of how this object was initially selected
-            $versionColumn = $this->owner->getSchema()->sqlColumnForField($this->owner, 'Version');
-            $dataQuery->where([
-                $versionColumn => $dataObject->Version
-            ]);
-            $dataQuery->setQueryParam('Versioned.mode', 'all_versions');
-        }
+        // Ideally in a newer release we can change use the extension as an extension
+        AugmentationExtension::singleton()->augmentLoadLazyFields( $query, $dataQuery, $dataObject);
     }
 
+    /**
+     * @deprecated this will be moved to the AugmentationExtension
+     */
     public function augmentDatabase()
     {
-        $owner = $this->owner;
-        $class = get_class($owner);
-        $schema = $owner->getSchema();
-        $baseTable = $this->baseTable();
-        $classTable = $schema->tableName($owner);
-
-        $isRootClass = $class === $owner->baseClass();
-
-        // Build a list of suffixes whose tables need versioning
-        $allSuffixes = [];
-        $versionableExtensions = (array)$owner->config()->get('versionableExtensions');
-        if (count($versionableExtensions)) {
-            foreach ($versionableExtensions as $versionableExtension => $suffixes) {
-                if ($owner->hasExtension($versionableExtension)) {
-                    foreach ((array)$suffixes as $suffix) {
-                        $allSuffixes[$suffix] = $versionableExtension;
-                    }
-                }
-            }
-        }
-
-        // Add the default table with an empty suffix to the list (table name = class name)
-        $allSuffixes[''] = null;
-
-        foreach ($allSuffixes as $suffix => $extension) {
-            // Check tables for this build
-            if ($suffix) {
-                $suffixBaseTable = "{$baseTable}_{$suffix}";
-                $suffixTable = "{$classTable}_{$suffix}";
-            } else {
-                $suffixBaseTable = $baseTable;
-                $suffixTable = $classTable;
-            }
-
-            $fields = $schema->databaseFields($class, false);
-            unset($fields['ID']);
-            if ($fields) {
-                $options = Config::inst()->get($class, 'create_table_options');
-                $indexes = $schema->databaseIndexes($class, false);
-                $extensionClass = $allSuffixes[$suffix];
-                if ($suffix && ($extension = $owner->getExtensionInstance($extensionClass))) {
-                    if (!$extension instanceof VersionableExtension) {
-                        throw new LogicException(
-                            "Extension {$extensionClass} must implement VersionableExtension"
-                        );
-                    }
-                    // Allow versionable extension to customise table fields and indexes
-                    try {
-                        $extension->setOwner($owner);
-                        if ($extension->isVersionedTable($suffixTable)) {
-                            $extension->updateVersionableFields($suffix, $fields, $indexes);
-                        }
-                    } finally {
-                        $extension->clearOwner();
-                    }
-                }
-
-                // Build _Live table
-                if ($this->hasStages()) {
-                    $liveTable = $this->stageTable($suffixTable, static::LIVE);
-                    DB::require_table($liveTable, $fields, $indexes, false, $options);
-                }
-
-                // Build _Versions table
-                //Unique indexes will not work on versioned tables, so we'll convert them to standard indexes:
-                $nonUniqueIndexes = $this->uniqueToIndex($indexes);
-                if ($isRootClass) {
-                    // Create table for all versions
-                    $versionFields = array_merge(
-                        Config::inst()->get(static::class, 'db_for_versions_table'),
-                        (array)$fields
-                    );
-                    $versionIndexes = array_merge(
-                        Config::inst()->get(static::class, 'indexes_for_versions_table'),
-                        (array)$nonUniqueIndexes
-                    );
-                } else {
-                    // Create fields for any tables of subclasses
-                    $versionFields = array_merge(
-                        [
-                            "RecordID" => "Int",
-                            "Version" => "Int",
-                        ],
-                        (array)$fields
-                    );
-                    $versionIndexes = array_merge(
-                        [
-                            'RecordID_Version' => [
-                                'type' => 'unique',
-                                'columns' => ['RecordID', 'Version']
-                            ],
-                            'RecordID' => [
-                                'type' => 'index',
-                                'columns' => ['RecordID'],
-                            ],
-                            'Version' => [
-                                'type' => 'index',
-                                'columns' => ['Version'],
-                            ],
-                        ],
-                        (array)$nonUniqueIndexes
-                    );
-                }
-
-                // Cleanup any orphans
-                $this->cleanupVersionedOrphans("{$suffixBaseTable}_Versions", "{$suffixTable}_Versions");
-
-                // Build versions table
-                DB::require_table("{$suffixTable}_Versions", $versionFields, $versionIndexes, true, $options);
-            } else {
-                DB::dont_require_table("{$suffixTable}_Versions");
-                if ($this->hasStages()) {
-                    $liveTable = $this->stageTable($suffixTable, static::LIVE);
-                    DB::dont_require_table($liveTable);
-                }
-            }
-        }
+        // Stop gap for the extension not yet being an extension
+        $augment = AugmentationExtension::singleton();
+        $augment->setTempObject($this->owner);
+        $augment->augmentDatabase();
     }
 
     /**
@@ -964,51 +586,7 @@ SQL
      */
     protected function cleanupVersionedOrphans($baseTable, $childTable)
     {
-        // Avoid if disabled
-        if ($this->owner->config()->get('versioned_orphans_disabled')) {
-            return;
-        }
 
-        // Skip if tables are the same (ignore case)
-        if (strcasecmp($childTable, $baseTable) === 0) {
-            return;
-        }
-
-        // Skip if child table doesn't exist
-        // If it does, ensure query case matches found case
-        $tables = DB::get_schema()->tableList();
-        if (!array_key_exists(strtolower($childTable), $tables)) {
-            return;
-        }
-        $childTable = $tables[strtolower($childTable)];
-
-        // Select all orphaned version records
-        $orphanedQuery = SQLSelect::create()
-            ->selectField("\"{$childTable}\".\"ID\"")
-            ->setFrom("\"{$childTable}\"");
-
-        // If we have a parent table limit orphaned records
-        // to only those that exist in this
-        if (array_key_exists(strtolower($baseTable), $tables)) {
-            // Ensure we match db table case
-            $baseTable = $tables[strtolower($baseTable)];
-            $orphanedQuery
-                ->addLeftJoin(
-                    $baseTable,
-                    "\"{$childTable}\".\"RecordID\" = \"{$baseTable}\".\"RecordID\"
-					AND \"{$childTable}\".\"Version\" = \"{$baseTable}\".\"Version\""
-                )
-                ->addWhere("\"{$baseTable}\".\"ID\" IS NULL");
-        }
-
-        $count = $orphanedQuery->count();
-        if ($count > 0) {
-            DB::alteration_message("Removing {$count} orphaned versioned records", "deleted");
-            $ids = $orphanedQuery->execute()->column();
-            foreach ($ids as $id) {
-                DB::prepared_query("DELETE FROM \"{$childTable}\" WHERE \"ID\" = ?", [$id]);
-            }
-        }
     }
 
     /**
@@ -2050,11 +1628,11 @@ SQL
      *
      * @param string $stage
      * @return string
+     * @deprecated use Table::singleton()->getBaseTable($this->owner, (string) $stage);
      */
     protected function baseTable($stage = null)
     {
-        $baseTable = $this->owner->baseTable();
-        return $this->stageTable($baseTable, $stage);
+        return Table::singleton()->getBaseTable($this->owner, (string) $stage);
     }
 
     /**

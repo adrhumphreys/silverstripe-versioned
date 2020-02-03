@@ -2,6 +2,8 @@
 
 namespace SilverStripe\Versioned\Query\Augmentation;
 
+use InvalidArgumentException;
+use SilverStripe\Core\Injector\Injectable;
 use SilverStripe\ORM\DataObject;
 use SilverStripe\ORM\DataQuery;
 use SilverStripe\ORM\Queries\SQLSelect;
@@ -10,9 +12,15 @@ use SilverStripe\Versioned\ReadingMode;
 use SilverStripe\Versioned\State;
 use SilverStripe\Versioned\Versioned;
 
+/*
+ * Reading a specific stage (Stage or Live)
+ */
 class Stage implements Augmentation
 {
-    public function augment(DataObject $dataObject, SQLSelect $query, DataQuery $dataQuery): void
+
+    use Injectable;
+
+    public function augment(DataObject $dataObject, SQLSelect $query, ?DataQuery $dataQuery): void
     {
         if (!State::singleton()->hasStages()) {
             return;
